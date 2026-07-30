@@ -1,0 +1,17 @@
+{
+  "name": "hive-light-api",
+  "version": "1.0.0",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.4.0",
+    "wrangler": "^4.115.0"
+  },
+  "dependencies": {
+    "hive-tx": "^7.2.0"
+  }
+}
