@@ -1,17 +1,26 @@
 {
   "name": "hive-light-api",
-  "version": "1.0.0",
-  "main": "src/index.ts",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Google sign-in and custodial Hive Lite registration on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "check": "npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "hive-tx": "^7.2.0",
+    "jose": "^6.1.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260730.1",
-    "typescript": "^5.4.0",
+    "typescript": "^5.6.3",
     "wrangler": "^4.115.0"
   },
-  "dependencies": {
-    "hive-tx": "^7.2.0"
+  "engines": {
+    "node": ">=22"
   }
 }

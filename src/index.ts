@@ -1,338 +1,199 @@
-import { Transaction, PrivateKey, config } from 'hive-tx';
+import type { Env, SessionUser, LiteAccountRow } from './types';
+import { verifyGoogleIdToken, readCookie, writeCookie, clearCookie, requireSameOrigin } from './auth';
+import { randomToken, createLiteKeyPair, encryptPrivateKey } from './crypto';
+import { upsertUser, createSession, sessionUser, revokeSession, findLiteAccount, saveLiteAccount, setLiteStatus } from './database';
+import { validLiteName } from './protocol';
+import { assertNameAvailable, broadcastRegistration, isRegistered, liteRpc } from './hive';
+import { DEMO_HTML, DEMO_JS } from './ui';
 
-export interface Env {
-  HIVE_MAIN_ACCOUNT: string;
-  SERVER_ACTIVE_KEY: string;
-  SERVER_POSTING_KEY: string;
-  HIVE_NODE?: string;
+const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+const MAX_JSON_BYTES = 12_000;
+const NONCE_AGE = 10 * 60;
+const SESSION_AGE = 7 * 24 * 60 * 60;
+
+function json(data: unknown, status = 200, cookies: string[] = []): Response {
+  const headers = new Headers(JSON_HEADERS);
+  for (const cookie of cookies) headers.append('Set-Cookie', cookie);
+  return new Response(JSON.stringify(data), { status, headers });
+}
+function fail(message: string, code = 400): Response { return json({ error: message }, code); }
+async function input(request: Request): Promise<Record<string, unknown>> {
+  const raw = await request.text();
+  if (raw.length > MAX_JSON_BYTES) throw new Error('Request body too large');
+  const value: unknown = JSON.parse(raw);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid JSON object');
+  return value as Record<string, unknown>;
+}
+function accountView(account: LiteAccountRow | null) {
+  if (!account) return null;
+  // Do not expose the encrypted keys, Google subject, or key management internals.
+  return {
+    did: `did:lite:${account.name}`,
+    name: account.name,
+    status: account.status,
+    txId: account.tx_id,
+    createdAt: account.created_at
+  };
+}
+async function authenticated(request: Request, env: Env): Promise<SessionUser | null> {
+  const token = readCookie(request, 'session');
+  return token ? sessionUser(env.DB, token) : null;
+}
+function writesReady(env: Env): boolean {
+  return env.ENABLE_L1_WRITES === 'true' &&
+    !!env.HIVE_MAIN_ACCOUNT && !!env.GATE_POSTING_KEY &&
+    !!env.KEY_ENCRYPTION_KEY && !!env.TURNSTILE_SECRET &&
+    !!env.TURNSTILE_SITE_KEY && !!env.LITE_RPC_URL;
+}
+async function checkTurnstile(request: Request, env: Env, token: unknown): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET || typeof token !== 'string' || token.length > 2048) return false;
+  const payload = new URLSearchParams({ secret: env.TURNSTILE_SECRET, response: token });
+  const ip = request.headers.get('CF-Connecting-IP');
+  if (ip) payload.set('remoteip', ip);
+  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST', body: payload, signal: AbortSignal.timeout(10000)
+  });
+  if (!res.ok) return false;
+  const result = await res.json() as { success?: boolean; hostname?: string };
+  // A production Turnstile widget must be restricted to the Worker hostname.
+  const hostname = new URL(request.url).hostname;
+  return result.success === true && result.hostname === hostname;
 }
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-};
+async function register(request: Request, env: Env, user: SessionUser): Promise<Response> {
+  if (!writesReady(env)) return fail('Registration is disabled until Gate, D1 and Turnstile are configured', 503);
+  const body = await input(request);
+  if (typeof body.name !== 'string' || !validLiteName(body.name)) {
+    return fail('Name must be 3-16 lowercase Hive-compatible characters (segments at least 3)');
+  }
+  if (await findLiteAccount(env.DB, user.sub)) return fail('This Google account already has a reserved Lite identity', 409);
+  if (!await checkTurnstile(request, env, body.turnstileToken)) return fail('Turnstile verification failed', 403);
+  await assertNameAvailable(env, body.name);
+  const owner = createLiteKeyPair();
+  const posting = createLiteKeyPair();
+  const secret = env.KEY_ENCRYPTION_KEY!;
+  const now = Math.floor(Date.now() / 1000);
+  const record: LiteAccountRow = {
+    google_sub: user.sub,
+    name: body.name,
+    owner_public: owner.publicKey,
+    posting_public: posting.publicKey,
+    owner_ciphertext: await encryptPrivateKey(owner.privateKey, secret, user.sub, body.name, 'owner'),
+    posting_ciphertext: await encryptPrivateKey(posting.privateKey, secret, user.sub, body.name, 'posting'),
+    status: 'pending', tx_id: null, created_at: now, updated_at: now
+  };
+  try {
+    await saveLiteAccount(env.DB, record);  // unique subject + unique name
+  } catch {
+    return fail('Name or Google account already reserved', 409);
+  }
+  try {
+    const txId = await broadcastRegistration(env, record.name, record.owner_public, record.posting_public);
+    await setLiteStatus(env.DB, user.sub, 'submitted', txId);
+    return json({ account: accountView({ ...record, status: 'submitted', tx_id: txId }), note: 'Broadcast submitted; indexing and authority confirmation are still pending.' }, 202);
+  } catch {
+    // Keep the encrypted keys and pending record so the identity is never silently replaced.
+    return fail('Broadcast not confirmed. Identity reserved locally; check the chain before retrying.', 502);
+  }
+}
 
-// Configuração baseada na documentação v7 do hive-tx
-const DEFAULT_NODE = 'https://api.hive.blog';
-config.nodes = [DEFAULT_NODE, 'https://api.deathwing.me'];
-config.timeout = 10000;
+async function retry(request: Request, env: Env, user: SessionUser): Promise<Response> {
+  if (!writesReady(env)) return fail('Writes are disabled', 503);
+  const account = await findLiteAccount(env.DB, user.sub);
+  if (!account || account.status !== 'pending') return fail('No pending registration to retry', 409);
+  const body = await input(request);
+  if (!await checkTurnstile(request, env, body.turnstileToken)) return fail('Turnstile verification failed', 403);
+  // A timeout may mean the first broadcast actually succeeded.
+  if (await isRegistered(env, account.name)) {
+    return fail('Name now exists on-chain; manual authority verification is required before retrying', 409);
+  }
+  const txId = await broadcastRegistration(env, account.name, account.owner_public, account.posting_public);
+  await setLiteStatus(env.DB, user.sub, 'submitted', txId);
+  return json({ account: accountView({ ...account, status: 'submitted', tx_id: txId }) }, 202);
+}
+
+async function route(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url), path = url.pathname;
+  if (path === '/' && request.method === 'GET') {
+    return new Response(DEMO_HTML, {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Content-Security-Policy': "default-src 'none'; script-src 'self' https://accounts.google.com/gsi/client https://challenges.cloudflare.com; style-src 'unsafe-inline' https://accounts.google.com/gsi/style; img-src 'self' https://lh3.googleusercontent.com data:; connect-src 'self' https://accounts.google.com https://challenges.cloudflare.com; frame-src https://accounts.google.com https://challenges.cloudflare.com; base-uri 'none'; form-action 'self'"
+      }
+    });
+  }
+  if (path === '/app.js' && request.method === 'GET') {
+    return new Response(DEMO_JS, { headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+  }
+  if (path === '/api/health' && request.method === 'GET') return json({ ok: true, service: 'lightaccounthive', version: 2 });
+  if (path === '/api/public/config' && request.method === 'GET') return json({
+    googleClientId: env.GOOGLE_CLIENT_ID || null,
+    registrationEnabled: writesReady(env),
+    turnstileSiteKey: env.TURNSTILE_SITE_KEY || null
+  });
+  if (path === '/api/lite/info' && request.method === 'GET') {
+    return json(await liteRpc(env, 'get_info', {}));
+  }
+  if (path === '/api/auth/challenge' && request.method === 'GET') {
+    const nonce = randomToken(24);
+    return json({ nonce }, 200, [writeCookie(request, 'oauth_nonce', nonce, NONCE_AGE)]);
+  }
+  if (request.method !== 'GET' && !requireSameOrigin(request)) return fail('Cross-origin requests are not allowed', 403);
+
+  if (path === '/api/auth/google' && request.method === 'POST') {
+    if (!env.GOOGLE_CLIENT_ID) return fail('Google client ID not configured', 503);
+    const nonce = readCookie(request, 'oauth_nonce');
+    if (!nonce) return fail('Login challenge missing or expired', 403);
+    const body = await input(request);
+    if (typeof body.credential !== 'string' || body.credential.length > 10000) return fail('Invalid Google credential');
+    let identity;
+    try {
+      identity = await verifyGoogleIdToken(body.credential, env.GOOGLE_CLIENT_ID, nonce);
+    } catch { return fail('Google ID token verification failed', 401); }
+    await upsertUser(env.DB, identity);
+    const token = await createSession(env.DB, identity.sub);
+    return json({ user: identity, account: accountView(await findLiteAccount(env.DB, identity.sub)) }, 200, [
+      clearCookie(request, 'oauth_nonce'), writeCookie(request, 'session', token, SESSION_AGE)
+    ]);
+  }
+
+  if (path === '/api/auth/logout' && request.method === 'POST') {
+    const token = readCookie(request, 'session');
+    if (token) await revokeSession(env.DB, token);
+    return json({ ok: true }, 200, [clearCookie(request, 'session')]);
+  }
+
+  const user = await authenticated(request, env);
+  if (path === '/api/auth/me' && request.method === 'GET') {
+    return user ? json({ user: { name: user.name, picture: user.picture }, account: accountView(await findLiteAccount(env.DB, user.sub)) })
+      : fail('Not authenticated', 401);
+  }
+  if (!user) return fail('Not authenticated', 401);
+  if (path === '/api/lite/account' && request.method === 'GET') {
+    return json({ account: accountView(await findLiteAccount(env.DB, user.sub)) });
+  }
+  if (path === '/api/lite/register' && request.method === 'POST') return register(request, env, user);
+  if (path === '/api/lite/retry' && request.method === 'POST') return retry(request, env, user);
+  if (path === '/api/lite/refresh' && request.method === 'POST') {
+    const account = await findLiteAccount(env.DB, user.sub);
+    if (!account) return fail('No Lite account', 404);
+    const indexed = await isRegistered(env, account.name);
+    // Name existence alone DOES NOT prove that our public keys became the authority.
+    return json({ account: accountView(account), indexed, authorityVerified: false });
+  }
+  return fail('Route not found', 404);
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    const url = new URL(request.url);
-
+    if (request.method === 'OPTIONS') return new Response(null, { status: 405, headers: JSON_HEADERS });
     try {
-      if (url.pathname === '/register' && request.method === 'POST') {
-        return await handleRegister(request, env);
-      }
-
-      if (url.pathname === '/sign-and-broadcast' && request.method === 'POST') {
-        return await handleSignAndBroadcast(request, env);
-      }
-
-      if (url.pathname === '/find-account' && request.method === 'GET') {
-        return await handleFindAccount(request, env);
-      }
-
-      if (url.pathname === '/main-accounts' && request.method === 'GET') {
-        return jsonResponse({ mainAccounts: [env.HIVE_MAIN_ACCOUNT] });
-      }
-
-      return jsonResponse({ error: 'Rota não encontrada' }, 404);
-    } catch (err: any) {
-      console.error(err);
-      return jsonResponse({ error: err.message || 'Erro interno no servidor' }, 500);
+      return await route(request, env);
+    } catch (error) {
+      console.error('Worker request failed', error instanceof Error ? error.name : 'UnknownError');
+      return fail('Request failed. Check configuration or upstream RPC availability.', 502);
     }
-  },
+  }
 };
-
-/**
- * Utilitário leve de JSON-RPC via fetch nativo para buscas
- */
-async function hiveRpcCall(nodeUrl: string, method: string, params: any): Promise<any> {
-  const res = await fetch(nodeUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      method,
-      params,
-      id: 1,
-    }),
-  });
-  return await res.json();
-}
-
-/**
- * ROTA 1: Registrar nova chave de postagem Light na conta do servidor
- */
-/**
- * ROTA 1: Registrar nova chave de postagem Light na conta do servidor com Nickname
- */
-async function handleRegister(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as { publicLightKey: string; nickname?: string };
-  const { publicLightKey, nickname } = body;
-
-  if (!publicLightKey) {
-    return jsonResponse({ error: 'publicLightKey é obrigatória' }, 400);
-  }
-
-  // Define um nickname padrão caso o usuário não envie um
-  const finalNickname = nickname || `Light_${publicLightKey.slice(0, 8)}`;
-
-  const nodeUrl = env.HIVE_NODE || DEFAULT_NODE;
-
-  // 1. Busca dados da conta via JSON-RPC nativo
-  const accountRes = await hiveRpcCall(nodeUrl, 'condenser_api.get_accounts', [[env.HIVE_MAIN_ACCOUNT]]);
-  if (!accountRes || !accountRes.result || accountRes.result.length === 0) {
-    return jsonResponse({ error: 'Conta principal não encontrada no Hive' }, 404);
-  }
-
-  const account = accountRes.result[0];
-  const postingAuth = account.posting;
-
-  // 2. Lidar com o posting_json_metadata
-  let postingJson: any = {};
-  try {
-    if (account.posting_json_metadata) {
-      postingJson = JSON.parse(account.posting_json_metadata);
-    }
-  } catch (e) {
-    // Se falhar no parse, continua com o objeto vazio
-  }
-
-  // Garante que o objeto light_accounts exista
-  if (!postingJson.light_accounts) {
-    postingJson.light_accounts = {};
-  }
-
-  // 3. Verificar se a chave já existe e atualizar a authority se necessário
-  const keyExists = postingAuth.key_auths.some(([key]: [string, number]) => key === publicLightKey);
-
-  // Se a chave não existe na authority, nós a adicionamos e reordenamos
-  if (!keyExists) {
-    postingAuth.key_auths.push([publicLightKey, 1]);
-    postingAuth.key_auths.sort((a: [string, number], b: [string, number]) => a[0].localeCompare(b[0]));
-  }
-
-  // Verifica se a chave já existe e se o nickname é o mesmo (evita transações desnecessárias)
-  if (keyExists && postingJson.light_accounts[publicLightKey] === finalNickname) {
-    return jsonResponse({ message: 'Chave já registrada na conta com este nickname' }, 200);
-  }
-
-  // Adiciona/Atualiza o nickname no json
-  postingJson.light_accounts[publicLightKey] = finalNickname;
-
-  // 4. Criar transação usando account_update2
-  const tx = new Transaction();
-  await tx.addOperation('account_update2', {
-    account: env.HIVE_MAIN_ACCOUNT,
-    posting: postingAuth,
-    memo_key: account.memo_key,
-    json_metadata: account.json_metadata || "", // Mantém o metadata antigo intacto
-    posting_json_metadata: JSON.stringify(postingJson),
-    extensions: []
-  });
-
-  // 5. Assinar (requer chave ativa para mudar a authority) e Transmitir
-  const serverPrivateKey = PrivateKey.from(env.SERVER_ACTIVE_KEY);
-  tx.sign(serverPrivateKey);
-
-  const result = await tx.broadcast();
-
-  if (result && result.error) {
-    return jsonResponse({ error: result.error }, 500);
-  }
-
-  return jsonResponse({
-    success: true,
-    txId: result?.result?.tx_id || result?.id,
-    message: 'Chave Light e Nickname registrados com sucesso!',
-    nickname: finalNickname
-  });
-}
-
-/**
- * ROTA 2: Validar, assinar via Multisig e transmitir transação
- */
-async function handleSignAndBroadcast(request: Request, env: Env): Promise<Response> {
-  const body = (await request.json()) as {
-    tx: any; // Este 'tx' é o objeto cru contendo ref_block_num, operations, etc.
-    signatureLight: string;
-    publicLightKey: string;
-  };
-
-  const { tx: rawTx, signatureLight, publicLightKey } = body;
-
-  if (!rawTx || !signatureLight || !publicLightKey) {
-    return jsonResponse({ error: 'tx, signatureLight e publicLightKey são obrigatórios' }, 400);
-  }
-
-// Garante que o objeto tenha a estrutura interna padrão do hive-tx (envelopado em .transaction)
-  const txObj = rawTx.transaction ? rawTx.transaction : rawTx;
-  const tx = new Transaction(txObj);
-
-  // Assegura que a propriedade interna exista para o loop ler com segurança
-  if (!tx.transaction) {
-    tx.transaction = txObj;
-  }
-
-  // 1. Regras de Isolamento de Escopo (Proteção)
-  const keyPrefix = await getKeyPrefix(publicLightKey);
-
-  // Na v7 o objeto 'transaction' pode vir como 'undefined' no typechecking, por isso usamos '!'
-  for (const op of tx.transaction!.operations) {
-    const [opName, opData] = op;
-
-    if (opName === 'comment') {
-      if (opData.author !== env.HIVE_MAIN_ACCOUNT) {
-        return jsonResponse({ error: 'O autor da operação deve ser a conta do sistema' }, 403);
-      }
-
-      if (!opData.permlink.startsWith(`u-${keyPrefix}-`)) {
-        return jsonResponse(
-          {
-            error: `Acesso negado: o permlink deve começar com 'u-${keyPrefix}-' para garantir a autoria.`,
-          },
-          403
-        );
-      }
-    } else if (opName === 'comment_options') {
-      if (opData.author !== env.HIVE_MAIN_ACCOUNT) {
-        return jsonResponse({ error: 'O autor da opção deve ser a conta do sistema' }, 403);
-      }
-
-      if (!opData.permlink.startsWith(`u-${keyPrefix}-`)) {
-        return jsonResponse(
-          {
-            error: `Acesso negado: o permlink das opções deve começar com 'u-${keyPrefix}-'.`,
-          },
-          403
-        );
-      }
-    } else if (opName === 'vote') {
-      if (opData.voter !== env.HIVE_MAIN_ACCOUNT) {
-        return jsonResponse({ error: 'Votante inválido' }, 403);
-      }
-    } else if (opName === 'custom_json') {
-      if (!opData.required_posting_auths.includes(env.HIVE_MAIN_ACCOUNT)) {
-        return jsonResponse({ error: 'Chave de postagem da conta principal necessária' }, 403);
-      }
-    } else {
-      return jsonResponse({ error: `Operação do tipo '${opName}' não é permitida para contas Light` }, 403);
-    }
-  }
-
-  // 2. Anexar a assinatura do cliente (Light)
-  tx.transaction!.signatures = tx.transaction!.signatures || [];
-  if (!tx.transaction!.signatures.includes(signatureLight)) {
-    tx.transaction!.signatures.push(signatureLight);
-  }
-
-  // Anexar assinatura do Servidor
-  const serverPrivateKey = PrivateKey.from(env.SERVER_POSTING_KEY);
-  tx.sign(serverPrivateKey);
-
-  // 3. Transmitir transação combinada
-  const result = await tx.broadcast();
-
-  if (result && result.error) {
-    return jsonResponse({ error: result.error }, 500);
-  }
-
-  return jsonResponse({
-    success: true,
-    txId: result?.result?.tx_id || result?.id,
-    blockNum: result?.result?.block_num || result?.block_num,
-  });
-}
-
-/**
- * ROTA 3: Descobrir qual conta principal gerencia uma determinada pubkey Light
- */
-async function handleFindAccount(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const publicLightKey = url.searchParams.get('pubkey');
-
-  if (!publicLightKey) {
-    return jsonResponse({ error: "Parâmetro 'pubkey' é obrigatório na query string" }, 400);
-  }
-
-  // Aqui você define quais são as suas contas principais de infraestrutura.
-  // No futuro, se criar a conta2, basta adicionar aqui: ['accountcreatorx', 'accountcreator_2', ...]
-  const mainAccounts = [env.HIVE_MAIN_ACCOUNT];
-  // Exemplo se tiver mais de uma fixa ou se quiser puxar de uma env em JSON:
-  // const mainAccounts = env.ALL_MAIN_ACCOUNTS ? JSON.parse(env.ALL_MAIN_ACCOUNTS) : [env.HIVE_MAIN_ACCOUNT];
-
-  const nodeUrl = env.HIVE_NODE || DEFAULT_NODE;
-
-  // Busca os dados de todas as contas principais em paralelo
-  const rpcPayload = mainAccounts.map((acc, index) => ({
-    jsonrpc: '2.0',
-    method: 'condenser_api.get_accounts',
-    params: [[acc]],
-    id: index + 1
-  }));
-
-  const res = await fetch(nodeUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(rpcPayload),
-  });
-
-  const results = await res.json();
-  const responses = Array.isArray(results) ? results : [results];
-
-  for (const resp of responses) {
-    if (resp && resp.result && resp.result.length > 0) {
-      const account = resp.result[0];
-      const accountName = account.name;
-
-      // Verifica no posting_json_metadata se a chave existe em light_accounts
-      try {
-        if (account.posting_json_metadata) {
-          const postingJson = JSON.parse(account.posting_json_metadata);
-          if (postingJson.light_accounts && postingJson.light_accounts[publicLightKey]) {
-            return jsonResponse({
-              found: true,
-              mainAccount: accountName,
-              nickname: postingJson.light_accounts[publicLightKey]
-            });
-          }
-        }
-      } catch (e) {
-        // Ignora erros de parse e continua buscando nas outras contas
-      }
-    }
-  }
-
-  return jsonResponse({
-    found: false,
-    message: 'Chave Light não encontrada em nenhuma conta principal do sistema.'
-  }, 404);
-}
-
-/**
- * Utilitário SHA256 usando Web Crypto API nativa do Cloudflare Worker
- */
-async function getKeyPrefix(pubKey: string): Promise<string> {
-  const msgUint8 = new TextEncoder().encode(pubKey);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 10);
-}
-
-function jsonResponse(data: object, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      ...corsHeaders,
-    },
-  });
-}
