@@ -14,3 +14,4 @@ jobs:
           node-version: '22'
       - run: npm install --no-audit --no-fund
       - run: npm run check
+      - run: npx wrangler deploy --dry-run --outdir ./dist
