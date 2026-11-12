@@ -25,11 +25,18 @@ export async function sha256(text: string): Promise<string> {
   return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(text))));
 }
 
+/** WebCrypto's BufferSource overload requires an owned ArrayBuffer in strict TS. */
+function asBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
 /** KEY_ENCRYPTION_KEY: one 32-byte secret encoded in base64url or base64. */
 async function encryptionKey(secret: string): Promise<CryptoKey> {
   const bytes = unbase64url(secret.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, ''));
   if (bytes.byteLength !== 32) throw new Error('KEY_ENCRYPTION_KEY must be 32 bytes');
-  return crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  return crypto.subtle.importKey('raw', asBuffer(bytes), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
 function aad(subject: string, name: string, role: string): Uint8Array {
@@ -42,9 +49,9 @@ export async function encryptPrivateKey(
   const key = await encryptionKey(secret);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const result = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: aad(subject, name, role) },
+    { name: 'AES-GCM', iv: asBuffer(iv), additionalData: asBuffer(aad(subject, name, role)) },
     key,
-    encoder.encode(wif)
+    asBuffer(encoder.encode(wif))
   );
   return `v1.${base64url(iv)}.${base64url(new Uint8Array(result))}`;
 }
@@ -57,9 +64,9 @@ export async function decryptPrivateKey(
   if (version !== 'v1' || !ivText || !ciphertext) throw new Error('Unsupported encrypted key');
   const key = await encryptionKey(secret);
   const plaintext = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: unbase64url(ivText), additionalData: aad(subject, name, role) },
+    { name: 'AES-GCM', iv: asBuffer(unbase64url(ivText)), additionalData: asBuffer(aad(subject, name, role)) },
     key,
-    unbase64url(ciphertext)
+    asBuffer(unbase64url(ciphertext))
   );
   return decoder.decode(plaintext);
 }
