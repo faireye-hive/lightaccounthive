@@ -1,12 +1,22 @@
 {
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "hive-light-api",
   "main": "src/index.ts",
-  "compatibility_date": "2024-09-23",
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "HIVE_MAIN_ACCOUNT": "accountcreatorx",
-    "HIVE_NODE": "https://api.hive.blog"
-  }
+    "HIVE_NODE": "https://api.hive.blog",
+    "LITE_RPC_URL": "https://api.syncad.com",
+    "HIVE_MAIN_ACCOUNT": "",
+    "TURNSTILE_SITE_KEY": "",
+    "ENABLE_L1_WRITES": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hive-light-accounts",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ]
 }
